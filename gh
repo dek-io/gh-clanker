@@ -2,8 +2,6 @@
 # gh-clanker — gh CLI wrapper that appends a suffix to PR/issue/release bodies.
 # Activated when GH_CLANKER_SUFFIX is set (its value IS the suffix, including leading newlines).
 
-set -euo pipefail
-
 # ── Find the real gh (skip ourselves) ──
 _self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gh"
 _real_gh=""
