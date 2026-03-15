@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# gh-clanker — gh CLI wrapper that appends a suffix to PR/issue/release bodies.
+# Activated when GH_CLANKER_SUFFIX is set (its value IS the suffix, including leading newlines).
+
+set -euo pipefail
+
+# ── Find the real gh (skip ourselves) ──
+_self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gh"
+_real_gh=""
+IFS=: read -ra _path_dirs <<< "$PATH"
+for _d in "${_path_dirs[@]}"; do
+  [[ -x "$_d/gh" && "$(cd "$_d" && pwd)/gh" != "$_self" ]] && { _real_gh="$_d/gh"; break; }
+done
+
+if [[ -z "$_real_gh" ]]; then
+  echo "gh-clanker: real gh not found in PATH" >&2
+  exit 1
+fi
+
+# ── Early gate: passthrough if suffix is unset/empty ──
+if [[ -z "${GH_CLANKER_SUFFIX:-}" ]]; then
+  exec "$_real_gh" "$@"
+fi
+
+_suffix="$GH_CLANKER_SUFFIX"
+# Trimmed version for duplicate checking
+_suffix_trimmed="${_suffix#"${_suffix%%[![:space:]]*}"}"
+
+# ── Temp-file cleanup ──
+_temp_files=()
+_cleanup() { (( ${#_temp_files[@]} )) && rm -f -- "${_temp_files[@]}"; }
+trap _cleanup EXIT
+
+# ── Helpers ──
+_append_suffix() {
+  local body="$1"
+  if [[ "$body" == *"$_suffix_trimmed"* ]]; then
+    printf '%s' "$body"
+  elif [[ -z "$body" ]]; then
+    printf '%s' "$_suffix_trimmed"
+  else
+    printf '%s%s' "$body" "$_suffix"
+  fi
+}
+
+# ── Route: determine if we intercept ──
+_cmd="${1:-}"
+_sub="${2:-}"
+
+case "$_cmd:$_sub" in
+  pr:create)      _tf="--body"  _ts="-b" _ff="--body-file"  _fs="-F" _skip="--web -w --editor -e --dry-run" ;;
+  pr:edit)        _tf="--body"  _ts="-b" _ff="--body-file"  _fs="-F" _skip="" ;;
+  pr:comment)     _tf="--body"  _ts="-b" _ff="--body-file"  _fs="-F" _skip="--web -w --editor -e" ;;
+  pr:review)      _tf="--body"  _ts="-b" _ff="--body-file"  _fs="-F" _skip="" ;;
+  pr:merge)       _tf="--body"  _ts="-b" _ff="--body-file"  _fs="-F" _skip="" ;;
+  issue:create)   _tf="--body"  _ts="-b" _ff="--body-file"  _fs="-F" _skip="--web -w --editor -e" ;;
+  issue:edit)     _tf="--body"  _ts="-b" _ff="--body-file"  _fs="-F" _skip="" ;;
+  issue:comment)  _tf="--body"  _ts="-b" _ff="--body-file"  _fs="-F" _skip="--web -w --editor -e" ;;
+  release:create) _tf="--notes" _ts="-n" _ff="--notes-file" _fs=""   _skip="--generate-notes --notes-from-tag" ;;
+  release:edit)   _tf="--notes" _ts="-n" _ff="--notes-file" _fs=""   _skip="" ;;
+  *)              exec "$_real_gh" "$@" ;;
+esac
+
+# Check skip flags
+for _a in "$@"; do
+  for _s in $_skip; do
+    [[ "$_a" == "$_s" ]] && exec "$_real_gh" "$@"
+  done
+done
+
+# ── Rewrite arguments ──
+_args=("$@")
+_rw=()
+_changed=0
+_supplied=0
+_i=0
+
+while (( _i < ${#_args[@]} )); do
+  _a="${_args[_i]}"
+
+  if [[ "$_a" == "$_tf" || ( -n "$_ts" && "$_a" == "$_ts" ) ]]; then
+    _supplied=1; _rw+=("$_a")
+    if (( _i + 1 < ${#_args[@]} )); then
+      (( _i++ )); _rw+=("$(_append_suffix "${_args[_i]}")"); _changed=1
+    fi
+
+  elif [[ "$_a" == "${_tf}="* ]]; then
+    _supplied=1; _rw+=("${_tf}=$(_append_suffix "${_a#"${_tf}="}")"); _changed=1
+
+  elif [[ "$_a" == "$_ff" || ( -n "$_fs" && "$_a" == "$_fs" ) ]]; then
+    _supplied=1; _rw+=("$_a")
+    if (( _i + 1 < ${#_args[@]} )); then
+      (( _i++ )); _src="${_args[_i]}"
+      if [[ "$_src" == "-" || -f "$_src" ]]; then
+        _tmp="$(mktemp -t gh-clanker.XXXXXX)"; _temp_files+=("$_tmp")
+        if [[ "$_src" == "-" ]]; then _bt="$(cat)"; else _bt="$(<"$_src")"; fi
+        _append_suffix "$_bt" > "$_tmp"; _rw+=("$_tmp"); _changed=1
+      else
+        _rw+=("$_src")
+      fi
+    fi
+
+  elif [[ "$_a" == "${_ff}="* ]]; then
+    _supplied=1; _src="${_a#"${_ff}="}"
+    if [[ "$_src" == "-" || -f "$_src" ]]; then
+      _tmp="$(mktemp -t gh-clanker.XXXXXX)"; _temp_files+=("$_tmp")
+      if [[ "$_src" == "-" ]]; then _bt="$(cat)"; else _bt="$(<"$_src")"; fi
+      _append_suffix "$_bt" > "$_tmp"; _rw+=("${_ff}=$_tmp"); _changed=1
+    else
+      _rw+=("$_a")
+    fi
+
+  else
+    _rw+=("$_a")
+  fi
+
+  (( _i++ ))
+done
+
+# ── Execute ──
+_rc=0
+if (( _changed )); then
+  "$_real_gh" "${_rw[@]}" || _rc=$?
+else
+  "$_real_gh" "$@" || _rc=$?
+fi
+
+# ── Post-create fixup: pr create without explicit body ──
+if (( _rc == 0 )) && [[ "$_cmd:$_sub" == "pr:create" ]] && (( ! _supplied )); then
+  _pb="$("$_real_gh" pr view --json body --jq .body 2>/dev/null || true)"
+  _ub="$(_append_suffix "${_pb:-}")"
+  if [[ "$_ub" != "${_pb:-}" ]]; then
+    "$_real_gh" pr edit --body "$_ub" >/dev/null 2>&1 || true
+  fi
+fi
+
+exit "$_rc"
