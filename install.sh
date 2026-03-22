@@ -28,7 +28,7 @@ fetch() {
 fetch "cli/gh" "$HOME/.local/bin/gh"
 info "Installed CLI wrapper → ~/.local/bin/gh"
 
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
+if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
   warn "~/.local/bin is not on PATH — add it to your shell profile"
 fi
 
@@ -50,6 +50,8 @@ MATCHER='^mcp__github__(create_pull_request|update_pull_request|add_issue_commen
 HOOK_CMD='bash ~/.claude/hooks/github-mcp-clanker.sh'
 
 TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+
 jq \
   --arg suffix "$DEFAULT_SUFFIX" \
   --arg matcher "$MATCHER" \

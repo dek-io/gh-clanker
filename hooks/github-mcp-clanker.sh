@@ -5,52 +5,41 @@
 
 set -euo pipefail
 
-SUFFIX="${GH_CLANKER_SUFFIX:-}"
-[[ -z "$SUFFIX" ]] && exit 0
+[[ -z "${GH_CLANKER_SUFFIX:-}" ]] && exit 0
 
-# Trim leading whitespace — used for dedup checks and empty-body fallback
-SUFFIX_TRIMMED="${SUFFIX#"${SUFFIX%%[![:space:]]*}"}"
-
-INPUT=$(cat)
-
-tool_name=$(printf '%s' "$INPUT" | jq -r '.tool_name // ""')
-
-# Determine which field to suffix based on the tool
-body_field=""
-case "$tool_name" in
-  mcp__github__create_pull_request)               body_field="body" ;;
-  mcp__github__update_pull_request)               body_field="body" ;;
-  mcp__github__add_issue_comment)                 body_field="body" ;;
-  mcp__github__add_comment_to_pending_review)     body_field="body" ;;
-  mcp__github__add_reply_to_pull_request_comment) body_field="body" ;;
-  mcp__github__issue_write)                       body_field="body" ;;
-  mcp__github__pull_request_review_write)         body_field="body" ;;
-  mcp__github__create_or_update_file)             body_field="message" ;;
-  mcp__github__push_files)                        body_field="message" ;;
-  *)
-    exit 0
-    ;;
-esac
-
-# All string ops in jq to avoid bash newline/control-char issues:
-# - Only modify if field is present (don't inject body into title-only updates)
-# - endswith() after rstrip for proper suffix detection
-# - Type-check: skip non-string values silently
-printf '%s' "$INPUT" | jq \
-  --arg field "$body_field" \
-  --arg suffix "$SUFFIX" \
-  --arg suffix_trimmed "$SUFFIX_TRIMMED" \
+# Single jq invocation: reads stdin once, handles tool dispatch + field rewrite in one pass.
+# SUFFIX_TRIMMED computed in jq to avoid bash string surgery with newlines.
+jq \
+  --arg suffix "$GH_CLANKER_SUFFIX" \
   '
-  .tool_input[$field] // null |
-  if . == null then
-    empty
-  elif type != "string" then
-    empty
-  elif (gsub("\\s+$"; "") | endswith($suffix_trimmed)) then
-    empty
-  elif . == "" then
-    { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ($field): $suffix_trimmed } } }
+  # Map tool name → field to suffix
+  (.tool_name // "") as $t |
+  (if   $t == "mcp__github__create_or_update_file" or $t == "mcp__github__push_files" then "message"
+   elif ($t | startswith("mcp__github__")) and ($t |
+     . == "mcp__github__create_pull_request" or
+     . == "mcp__github__update_pull_request" or
+     . == "mcp__github__add_issue_comment" or
+     . == "mcp__github__add_comment_to_pending_review" or
+     . == "mcp__github__add_reply_to_pull_request_comment" or
+     . == "mcp__github__issue_write" or
+     . == "mcp__github__pull_request_review_write")
+   then "body"
+   else null end) as $field |
+
+  if $field == null then empty
   else
-    { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ($field): (. + $suffix) } } }
+    ($suffix | ltrimstr("\n") | ltrimstr("\n") | ltrimstr(" ")) as $suffix_trimmed |
+    .tool_input[$field] // null |
+    if . == null then
+      empty
+    elif type != "string" then
+      empty
+    elif (gsub("\\s+$"; "") | endswith($suffix_trimmed)) then
+      empty
+    elif . == "" then
+      { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ($field): $suffix_trimmed } } }
+    else
+      { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ($field): (. + $suffix) } } }
+    end
   end
   '
